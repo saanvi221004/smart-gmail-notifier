@@ -1,28 +1,34 @@
 import { gmailAPI } from './gmail.js';
 import { aiProcessor } from './ai.js';
 
+/* =========================
+   Storage Keys
+========================= */
 const STORAGE_KEYS = {
   PROCESSED_MESSAGES: 'processed_messages',
   SETTINGS: 'settings',
   LAST_CHECK: 'last_check'
 };
 
+/* =========================
+   Gmail Notifier
+========================= */
 class GmailNotifier {
   constructor() {
     this.isRunning = false;
     this.authToken = null;
     this.processedMessages = new Set();
+
+    // ✅ hard defaults
+    this.settings = {
+      pollingInterval: 60 // seconds (Chrome-safe)
+    };
   }
 
+  /* ---------- Init ---------- */
   async initialize() {
-    try {
-      await this.loadStoredData();
-      await this.authenticate();
-      await this.startPolling();
-      console.log('Gmail Notifier initialized successfully');
-    } catch (error) {
-      console.error('Failed to initialize Gmail Notifier:', error);
-    }
+    await this.loadStoredData();
+    console.log('Smart Gmail Notifier initialized with settings:', this.settings);
   }
 
   async loadStoredData() {
@@ -31,67 +37,73 @@ class GmailNotifier {
       STORAGE_KEYS.SETTINGS
     ]);
 
-    // ✅ ALWAYS convert stored array → Set
-    const storedMessages = data[STORAGE_KEYS.PROCESSED_MESSAGES] || [];
-    this.processedMessages = new Set(storedMessages);
+    this.processedMessages = new Set(
+      data[STORAGE_KEYS.PROCESSED_MESSAGES] || []
+    );
 
-    this.settings = data[STORAGE_KEYS.SETTINGS] || {
-      pollingInterval: 30
+    const storedSettings = data[STORAGE_KEYS.SETTINGS] || {};
+
+    // ✅ SANITIZE pollingInterval
+    let interval = Number(storedSettings.pollingInterval);
+
+    if (!Number.isFinite(interval) || interval < 60) {
+      interval = 60; // Chrome minimum safe value
+    }
+
+    this.settings = {
+      pollingInterval: interval
     };
   }
 
+  /* ---------- Auth ---------- */
   async authenticate(forceRefresh = false) {
-    try {
-      if (forceRefresh && this.authToken) {
-        await new Promise(resolve => {
-          chrome.identity.removeCachedAuthToken(
-            { token: this.authToken },
-            resolve
-          );
-        });
-        this.authToken = null;
-      }
-
-      const token = await new Promise((resolve, reject) => {
-        chrome.identity.getAuthToken({ interactive: true }, token => {
-          if (chrome.runtime.lastError) {
-            reject(chrome.runtime.lastError);
-          } else {
-            resolve(token);
-          }
-        });
-      });
-
-      this.authToken = token;
-      console.log('Authentication successful');
-      return token;
-    } catch (error) {
-      console.error('Authentication failed:', error);
-      throw error;
+    if (forceRefresh && this.authToken) {
+      await chrome.identity.removeCachedAuthToken({ token: this.authToken });
+      this.authToken = null;
     }
+
+    const token = await new Promise((resolve, reject) => {
+      chrome.identity.getAuthToken({ interactive: true }, token => {
+        if (chrome.runtime.lastError) {
+          reject(chrome.runtime.lastError);
+        } else {
+          resolve(token);
+        }
+      });
+    });
+
+    this.authToken = token;
+    return token;
   }
 
+  /* ---------- Polling ---------- */
   async startPolling() {
     if (this.isRunning) return;
 
     this.isRunning = true;
 
-    await chrome.alarms.create('gmail-poll', {
-      periodInMinutes: 0.5 // 30 seconds
+    const minutes = this.settings.pollingInterval / 60;
+
+    chrome.alarms.create('gmail-poll', {
+      periodInMinutes: minutes
     });
 
-    await this.checkForNewEmails();
+    // fire once immediately (non-blocking)
+    this.checkForNewEmails();
 
-    chrome.alarms.onAlarm.addListener(alarm => {
-      if (alarm.name === 'gmail-poll') {
-        this.checkForNewEmails();
-      }
-    });
-
-    console.log('Email polling started');
+    console.log('Email polling started every', minutes, 'minutes');
   }
 
+  async stopPolling() {
+    this.isRunning = false;
+    await chrome.alarms.clear('gmail-poll');
+    console.log('Email polling stopped');
+  }
+
+  /* ---------- Gmail ---------- */
   async checkForNewEmails() {
+    if (!this.isRunning) return;
+
     try {
       if (!this.authToken) {
         await this.authenticate();
@@ -100,9 +112,9 @@ class GmailNotifier {
       const unreadEmails = await gmailAPI.getUnreadEmails(this.authToken);
 
       for (const email of unreadEmails) {
-        if (!this.isMessageProcessed(email.id)) {
-          await this.processNewEmail(email);
-          await this.markMessageAsProcessed(email.id);
+        if (!this.processedMessages.has(email.id)) {
+          await this.processEmail(email);
+          await this.markAsProcessed(email.id);
         }
       }
 
@@ -110,79 +122,87 @@ class GmailNotifier {
         [STORAGE_KEYS.LAST_CHECK]: new Date().toISOString()
       });
     } catch (error) {
-      console.error('Error checking for new emails:', error);
+      console.error('Email check failed:', error);
 
-      // ✅ Correct 401 handling
       if (error.message?.includes('401')) {
-        console.warn('401 detected. Refreshing token and retrying...');
         await this.authenticate(true);
       }
     }
   }
 
-  isMessageProcessed(messageId) {
-    return this.processedMessages.has(messageId);
-  }
-
-  async markMessageAsProcessed(messageId) {
+  async markAsProcessed(messageId) {
     this.processedMessages.add(messageId);
     await chrome.storage.local.set({
       [STORAGE_KEYS.PROCESSED_MESSAGES]: Array.from(this.processedMessages)
     });
   }
 
-  async processNewEmail(email) {
-    try {
-      const result = await aiProcessor.processEmail(
-        email.subject || '',
-        email.body || email.snippet || ''
-      );
-
-      await this.showNotification(email, result);
-    } catch (error) {
-      console.error('Error processing email:', error);
-    }
-  }
-
-  async showNotification(email, aiResult) {
-    const notificationId = `gmail-${email.id}`;
-
-    chrome.notifications.create(
-      notificationId,
-      {
-        type: 'basic',
-        iconUrl: chrome.runtime.getURL('icons/icon128.png'),
-        title: `New Email from ${email.from?.name || email.from?.email || 'Unknown'}`,
-        message: `${aiResult.summary}\n${aiResult.tag}`
-      },
-      () => {
-        if (chrome.runtime.lastError) {
-          console.error('Notification error:', chrome.runtime.lastError);
-        }
-      }
+  /* ---------- AI + Notify ---------- */
+  async processEmail(email) {
+    const result = await aiProcessor.processEmail(
+      email.subject || '',
+      email.body || email.snippet || ''
     );
-  }
 
-  async stop() {
-    this.isRunning = false;
-    await chrome.alarms.clear('gmail-poll');
-    console.log('Gmail Notifier stopped');
+    chrome.notifications.create(`gmail-${email.id}`, {
+      type: 'basic',
+      iconUrl: chrome.runtime.getURL('icons/icon128.png'),
+      title: `New Email from ${email.from?.name || email.from?.email || 'Unknown'}`,
+      message: `${result.summary}\n${result.tag}`
+    });
   }
 }
 
+/* =========================
+   Instance
+========================= */
 const notifier = new GmailNotifier();
 
+/* =========================
+   Alarm Listener
+========================= */
+chrome.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === 'gmail-poll' && notifier.isRunning) {
+    notifier.checkForNewEmails();
+  }
+});
+
+/* =========================
+   Lifecycle
+========================= */
 chrome.runtime.onInstalled.addListener(() => {
-  console.log('Smart Gmail Notifier installed');
   notifier.initialize();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  console.log('Smart Gmail Notifier started');
   notifier.initialize();
 });
 
+/* =========================
+   Message Bridge
+========================= */
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+
+  if (request.action === 'togglePolling') {
+    (async () => {
+      try {
+        if (notifier.isRunning) {
+          await notifier.stopPolling();
+        } else {
+          await notifier.authenticate();
+          await notifier.startPolling();
+        }
+
+        sendResponse({ isRunning: notifier.isRunning });
+      } catch (err) {
+        console.error('Toggle failed:', err);
+        sendResponse({ isRunning: false, error: err.message });
+      }
+    })();
+
+    return true; // REQUIRED
+  }
+
   if (request.action === 'getStatus') {
     sendResponse({
       isRunning: notifier.isRunning,
@@ -191,7 +211,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request.action === 'clearProcessed') {
-    notifier.processedMessages = new Set();
+    notifier.processedMessages.clear();
     chrome.storage.local.set({
       [STORAGE_KEYS.PROCESSED_MESSAGES]: []
     });
