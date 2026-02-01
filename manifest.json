@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Smart Gmail Notifier",
+  "version": "1.0.0",
+  "description": "AI-powered Gmail notifications with summaries and intent classification",
+  "permissions": [
+    "identity",
+    "storage",
+    "notifications",
+    "alarms"
+    ],
+  "host_permissions": [
+    "https://www.googleapis.com/*",
+    "https://gmail.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Smart Gmail Notifier"
+  },
+  "icons": {
+    "128": "icons/icon128.png"
+  },
+  "oauth2": {
+    "client_id": "160505270925-f37uek9na37r4k3s3hjnrsj4mc8ms6lj.apps.googleusercontent.com",
+    "scopes": [
+      "https://www.googleapis.com/auth/gmail.readonly"
+    ]
+  }
+}
